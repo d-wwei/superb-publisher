@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# medium-cli — Medium publishing tool
+# Zero dependencies beyond curl (macOS/Linux built-in)
+set -euo pipefail
+
+CONF_DIR="${HOME}/.config/medium-cli"
+CONF_FILE="${CONF_DIR}/config"
+API="https://api.medium.com/v1"
+
+die()  { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m→\033[0m %s\n' "$*" >&2; }
+
+# ── JSON helpers (pure awk/sed, prefer jq if available) ──────────────
+
+HAS_JQ=false
+command -v jq &>/dev/null && HAS_JQ=true
+
+json_str() {
+    if $HAS_JQ; then
+        printf '%s' "$1" | jq -r ".$2 // empty" 2>/dev/null
+    else
+        printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+    fi
+}
+
+json_int() {
+    if $HAS_JQ; then
+        printf '%s' "$1" | jq -r ".$2 // empty" 2>/dev/null
+    else
+        printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p" | head -1
+    fi
+}
+
+json_arr_str() {
+    # Extract string values from a JSON array field: json_arr_str "$json" "fieldName"
+    if $HAS_JQ; then
+        printf '%s' "$1" | jq -r ".$2[]? // empty" 2>/dev/null
+    else
+        # Fallback: extract array content, split by comma, strip quotes
+        printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p" \
+            | tr ',' '\n' | sed 's/^[[:space:]]*"//;s/"[[:space:]]*$//' | grep -v '^$'
+    fi
+}
+
+json_escape() {
+    # Escape a string for embedding in JSON
+    printf '%s' "$1" | awk '{
+        gsub(/\\/, "\\\\")
+        gsub(/"/, "\\\"")
+        gsub(/\t/, "\\t")
+        gsub(/\r/, "")
+        gsub(/\n/, "\\n")
+        printf "%s", $0
+    }'
+}
+
+json_escape_file() {
+    awk 'BEGIN{ORS=""} {
+        gsub(/\\/, "\\\\")
+        gsub(/"/, "\\\"")
+        gsub(/\t/, "\\t")
+        gsub(/\r/, "")
+        if (NR > 1) printf "\\n"
+        print
+    }' "$1"
+}
+
+# ── Error handling ───────────────────────────────────────────────────
+
+explain_err() {
+    local code="$1" msg="$2"
+    case "$code" in
+        401)  echo "Unauthorized — token is invalid or expired. Get a new one at medium.com/me/settings/security";;
+        403)  echo "Forbidden — your token lacks permission for this action";;
+        429)  echo "Rate limited — too many requests. Wait a few minutes and try again";;
+        *)
+            # Try to extract error message from response body
+            if [[ -n "$msg" ]]; then
+                echo "$msg"
+            else
+                echo "HTTP $code"
+            fi
+            ;;
+    esac
+}
+
+check_err() {
+    local resp="$1" http_code="$2" ctx="$3"
+
+    # Check HTTP status code first
+    if [[ "$http_code" -ge 400 ]]; then
+        local errors_msg=""
+        errors_msg=$(json_str "$resp" "message" 2>/dev/null) || true
+        local hint
+        hint=$(explain_err "$http_code" "$errors_msg")
+        die "${ctx}: ${hint}"
+    fi
+
+    # Check for errors array in response body
+    local err_msg=""
+    if $HAS_JQ; then
+        err_msg=$(printf '%s' "$resp" | jq -r '.errors[0].message // empty' 2>/dev/null) || true
+    else
+        err_msg=$(printf '%s' "$resp" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || true
+    fi
+
+    if [[ -n "$err_msg" ]] && printf '%s' "$resp" | grep -q '"errors"'; then
+        die "${ctx}: ${err_msg}"
+    fi
+}
+
+# ── Auth header ──────────────────────────────────────────────────────
+
+auth_header() {
+    echo "Authorization: Bearer ${MEDIUM_TOKEN}"
+}
+
+# ── Config ───────────────────────────────────────────────────────────
+
+load_config() {
+    [[ -f "$CONF_FILE" ]] || die "Config not found. Run: medium-cli init"
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+    # Also check environment variable
+    MEDIUM_TOKEN="${MEDIUM_TOKEN:-}"
+    [[ -n "$MEDIUM_TOKEN" ]] || die "MEDIUM_TOKEN empty in $CONF_FILE (or set as env var)"
+}
+
+cmd_init() {
+    mkdir -p "$CONF_DIR"
+    if [[ -f "$CONF_FILE" ]]; then
+        info "Config already exists: $CONF_FILE"
+        return
+    fi
+    cat > "$CONF_FILE" <<'EOF'
+# Medium Integration Token
+# Get yours at: https://medium.com/me/settings/security
+MEDIUM_TOKEN=""
+EOF
+    chmod 600 "$CONF_FILE"
+    info "Created: $CONF_FILE"
+    info "1. Go to https://medium.com/me/settings/security"
+    info "2. Generate an Integration Token"
+    info "3. Paste it into $CONF_FILE"
+    info "4. Test with: medium-cli whoami"
+}
+
+# ── Get current user ─────────────────────────────────────────────────
+
+get_user_id() {
+    # Returns the authorId for the authenticated user
+    local resp http_code
+    http_code=$(curl -sS -o /tmp/medium-cli-resp -w '%{http_code}' \
+        -H "$(auth_header)" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        "${API}/me")
+    resp=$(cat /tmp/medium-cli-resp)
+    rm -f /tmp/medium-cli-resp
+    check_err "$resp" "$http_code" "get user"
+
+    local uid=""
+    if $HAS_JQ; then
+        uid=$(printf '%s' "$resp" | jq -r '.data.id // empty' 2>/dev/null)
+    else
+        uid=$(json_str "$resp" "id")
+    fi
+    [[ -n "$uid" ]] || die "Could not extract user ID from response"
+    printf '%s' "$uid"
+}
+
+cmd_whoami() {
+    load_config
+    local resp http_code
+    http_code=$(curl -sS -o /tmp/medium-cli-resp -w '%{http_code}' \
+        -H "$(auth_header)" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        "${API}/me")
+    resp=$(cat /tmp/medium-cli-resp)
+    rm -f /tmp/medium-cli-resp
+    check_err "$resp" "$http_code" "whoami"
+
+    local name username url
+    if $HAS_JQ; then
+        name=$(printf '%s' "$resp" | jq -r '.data.name // empty' 2>/dev/null)
+        username=$(printf '%s' "$resp" | jq -r '.data.username // empty' 2>/dev/null)
+        url=$(printf '%s' "$resp" | jq -r '.data.url // empty' 2>/dev/null)
+    else
+        # The response is nested: {"data": {...}}
+        # For sed fallback we search in the whole string
+        name=$(json_str "$resp" "name")
+        username=$(json_str "$resp" "username")
+        url=$(json_str "$resp" "url")
+    fi
+
+    info "Authenticated as:"
+    printf '  Name:     %s\n' "${name:-?}"
+    printf '  Username: %s\n' "${username:-?}"
+    printf '  URL:      %s\n' "${url:-?}"
+}
+
+# ── List publications ────────────────────────────────────────────────
+
+cmd_publications() {
+    load_config
+    local uid
+    uid=$(get_user_id)
+
+    local resp http_code
+    http_code=$(curl -sS -o /tmp/medium-cli-resp -w '%{http_code}' \
+        -H "$(auth_header)" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        "${API}/users/${uid}/publications")
+    resp=$(cat /tmp/medium-cli-resp)
+    rm -f /tmp/medium-cli-resp
+    check_err "$resp" "$http_code" "publications"
+
+    if $HAS_JQ; then
+        local count
+        count=$(printf '%s' "$resp" | jq '.data | length' 2>/dev/null)
+        if [[ "$count" == "0" || -z "$count" ]]; then
+            info "No publications found"
+            return
+        fi
+        info "Publications ($count):"
+        printf '%s' "$resp" | jq -r '.data[] | "  \(.id)\t\(.name)\t\(.url)"' 2>/dev/null
+    else
+        # Fallback: extract publication entries manually
+        # Look for id/name pairs in the response
+        local ids names
+        ids=$(printf '%s' "$resp" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | sed 's/"id"[[:space:]]*:[[:space:]]*"//;s/"$//')
+        names=$(printf '%s' "$resp" | grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | sed 's/"name"[[:space:]]*:[[:space:]]*"//;s/"$//')
+
+        if [[ -z "$ids" ]]; then
+            info "No publications found"
+            return
+        fi
+
+        info "Publications:"
+        paste <(echo "$ids") <(echo "$names") | while IFS=$'\t' read -r pid pname; do
+            printf '  %s\t%s\n' "$pid" "$pname"
+        done
+    fi
+}
+
+# ── Publish article ──────────────────────────────────────────────────
+
+cmd_publish() {
+    local title="" html_file="" md_file="" tags="" status="draft" publication=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title)       title="$2";       shift 2;;
+            --html)        html_file="$2";   shift 2;;
+            --md)          md_file="$2";     shift 2;;
+            --tags)        tags="$2";        shift 2;;
+            --status)      status="$2";      shift 2;;
+            --publication) publication="$2"; shift 2;;
+            *) die "Unknown option: $1";;
+        esac
+    done
+
+    [[ -n "$title" ]] || die "--title required"
+
+    # Determine content format and source
+    local content_format="" content_file=""
+    if [[ -n "$html_file" ]]; then
+        [[ -f "$html_file" ]] || die "File not found: $html_file"
+        content_format="html"
+        content_file="$html_file"
+    elif [[ -n "$md_file" ]]; then
+        [[ -f "$md_file" ]] || die "File not found: $md_file"
+        content_format="markdown"
+        content_file="$md_file"
+    else
+        die "Either --html <file> or --md <file> required"
+    fi
+
+    # Validate status
+    case "$status" in
+        draft|public|unlisted) ;;
+        *) die "Invalid --status: $status (must be: draft, public, unlisted)";;
+    esac
+
+    load_config
+
+    # Determine endpoint: user posts or publication posts
+    local endpoint
+    if [[ -n "$publication" ]]; then
+        endpoint="${API}/publications/${publication}/posts"
+    else
+        local uid
+        uid=$(get_user_id)
+        endpoint="${API}/users/${uid}/posts"
+    fi
+
+    # Build JSON body
+    local tmp
+    tmp=$(mktemp)
+
+    local e_title
+    e_title=$(json_escape "$title")
+
+    # Build tags array
+    local tags_json="[]"
+    if [[ -n "$tags" ]]; then
+        if $HAS_JQ; then
+            # Use jq to build proper JSON array from comma-separated string
+            tags_json=$(printf '%s' "$tags" | tr ',' '\n' | jq -R . | jq -s .)
+        else
+            # Build JSON array manually
+            tags_json="["
+            local first=true
+            IFS=',' read -ra tag_arr <<< "$tags"
+            for t in "${tag_arr[@]}"; do
+                # Trim whitespace
+                t=$(printf '%s' "$t" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if $first; then
+                    first=false
+                else
+                    tags_json+=","
+                fi
+                tags_json+="\"$(json_escape "$t")\""
+            done
+            tags_json+="]"
+        fi
+    fi
+
+    # Stream content into JSON file to handle large articles
+    {
+        printf '{"title":"%s","contentFormat":"%s","content":"' \
+            "$e_title" "$content_format"
+        json_escape_file "$content_file"
+        printf '","tags":%s,"publishStatus":"%s"}' \
+            "$tags_json" "$status"
+    } > "$tmp"
+
+    local resp http_code
+    http_code=$(curl -sS -o /tmp/medium-cli-resp -w '%{http_code}' \
+        -X POST "$endpoint" \
+        -H "$(auth_header)" \
+        -H "Content-Type: application/json" \
+        -H "Accept: application/json" \
+        --data-binary "@${tmp}")
+    resp=$(cat /tmp/medium-cli-resp)
+    rm -f "$tmp" /tmp/medium-cli-resp
+    check_err "$resp" "$http_code" "publish"
+
+    # Extract article URL from response
+    local article_url article_id
+    if $HAS_JQ; then
+        article_url=$(printf '%s' "$resp" | jq -r '.data.url // empty' 2>/dev/null)
+        article_id=$(printf '%s' "$resp" | jq -r '.data.id // empty' 2>/dev/null)
+    else
+        article_url=$(json_str "$resp" "url")
+        article_id=$(json_str "$resp" "id")
+    fi
+
+    info "Published (status: ${status})"
+    if [[ -n "$article_url" ]]; then
+        info "URL: ${article_url}"
+        echo "$article_url"
+    elif [[ -n "$article_id" ]]; then
+        info "Article ID: ${article_id}"
+        echo "$article_id"
+    else
+        info "Response: $resp"
+    fi
+}
+
+# ── Usage ────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'USAGE'
+medium-cli — Medium publishing tool
+
+Commands:
+  init                          Create config file (~/.config/medium-cli/config)
+  whoami                        Test token, show authenticated user
+  publications                  List your publications (id + name)
+  publish  --title T --html F [--tags "a,b"] [--status draft|public|unlisted] [--publication PUB_ID]
+  publish  --title T --md   F [--tags "a,b"] [--status draft|public|unlisted] [--publication PUB_ID]
+
+Options:
+  --title         Article title (required)
+  --html <file>   HTML content file
+  --md   <file>   Markdown content file
+  --tags          Comma-separated tags (max 5 on Medium)
+  --status        draft (default), public, or unlisted
+  --publication   Publish under a publication (use publication ID from 'publications' command)
+
+Typical workflow:
+  medium-cli init                                      # one-time setup
+  medium-cli whoami                                    # verify token
+  medium-cli publish --title "My Post" --md article.md --tags "AI,Tech" --status draft
+
+Config: ~/.config/medium-cli/config
+USAGE
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    init)           cmd_init;;
+    whoami)         cmd_whoami;;
+    publications)   cmd_publications;;
+    publish)        shift; cmd_publish "$@";;
+    -h|--help|help) usage;;
+    *)              die "Unknown: $1 (try: medium-cli help)";;
+esac

@@ -1,0 +1,21 @@
+node_modules/
+dist/
+*.js
+*.d.ts
+*.js.map
+*.d.ts.map
+!bin/
+.assistant/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (may contain sensitive cookies)
+# ~/.config/social-cli/ is the runtime config dir, not tracked here
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

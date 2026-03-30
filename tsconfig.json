@@ -1,0 +1,9 @@
+{
+  "files": [],
+  "references": [
+    { "path": "core" },
+    { "path": "platforms/xhs" },
+    { "path": "platforms/douyin" },
+    { "path": "platforms/x" }
+  ]
+}

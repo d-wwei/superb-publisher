@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+# linkedin-cli — LinkedIn post/article publishing tool
+# Zero dependencies beyond curl + bash (macOS/Linux built-in)
+set -euo pipefail
+
+CONF_DIR="${HOME}/.config/linkedin-cli"
+CONF_FILE="${CONF_DIR}/config"
+TOKEN_FILE="${CONF_DIR}/token"
+REDIRECT_PORT=8585
+REDIRECT_URI="http://localhost:${REDIRECT_PORT}/callback"
+AUTH_URL="https://www.linkedin.com/oauth/v2"
+API_BASE="https://api.linkedin.com"
+
+die()  { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m->\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33mWARN:\033[0m %s\n' "$*" >&2; }
+
+# ── JSON helpers ─────────────────────────────────────────────────────
+
+# Prefer jq if available, fallback to sed/awk
+HAS_JQ=false
+command -v jq >/dev/null 2>&1 && HAS_JQ=true
+
+json_str() {
+    if $HAS_JQ; then
+        printf '%s' "$1" | jq -r ".$2 // empty" 2>/dev/null
+    else
+        printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+    fi
+}
+
+json_int() {
+    if $HAS_JQ; then
+        printf '%s' "$1" | jq -r ".$2 // empty" 2>/dev/null
+    else
+        printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p" | head -1
+    fi
+}
+
+json_escape() {
+    # Escape a string for embedding in JSON
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | awk '{
+        if (NR > 1) printf "\\n"
+        printf "%s", $0
+    }'
+}
+
+# ── Error handling ───────────────────────────────────────────────────
+
+explain_err() {
+    local status="$1" msg="$2"
+    case "$status" in
+        401) echo "Unauthorized — token expired or invalid. Run: linkedin-cli login";;
+        403) echo "Forbidden — missing required permissions (w_member_social scope)";;
+        404) echo "Resource not found";;
+        422) echo "Unprocessable entity — check your request data";;
+        429) echo "Rate limit exceeded — wait and retry";;
+        *)   echo "$msg";;
+    esac
+}
+
+check_http() {
+    local http_code="$1" body="$2" ctx="$3"
+    if [[ "$http_code" -ge 400 ]]; then
+        local msg
+        msg=$(json_str "$body" "message")
+        local hint
+        hint=$(explain_err "$http_code" "$msg")
+        die "${ctx}: HTTP ${http_code} — ${hint}"
+    fi
+}
+
+# ── Config ───────────────────────────────────────────────────────────
+
+load_config() {
+    [[ -f "$CONF_FILE" ]] || die "Config not found. Run: linkedin-cli init"
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+    [[ -n "${LINKEDIN_CLIENT_ID:-}" ]]     || die "LINKEDIN_CLIENT_ID empty in $CONF_FILE"
+    [[ -n "${LINKEDIN_CLIENT_SECRET:-}" ]] || die "LINKEDIN_CLIENT_SECRET empty in $CONF_FILE"
+}
+
+cmd_init() {
+    mkdir -p "$CONF_DIR"
+    if [[ -f "$CONF_FILE" ]]; then
+        info "Config already exists: $CONF_FILE"
+        return
+    fi
+    cat > "$CONF_FILE" <<'EOF'
+LINKEDIN_CLIENT_ID=""
+LINKEDIN_CLIENT_SECRET=""
+EOF
+    chmod 600 "$CONF_FILE"
+    info "Created: $CONF_FILE"
+    info "Fill in your LinkedIn App credentials, then run: linkedin-cli login"
+    info ""
+    info "To get credentials:"
+    info "  1. Go to https://www.linkedin.com/developers/apps"
+    info "  2. Create an app (or use existing)"
+    info "  3. Under 'Auth' tab, copy Client ID and Client Secret"
+    info "  4. Add http://localhost:${REDIRECT_PORT}/callback to Authorized redirect URLs"
+    info "  5. Under 'Products' tab, request 'Share on LinkedIn' and 'Sign In with LinkedIn using OpenID Connect'"
+}
+
+# ── OAuth 2.0 ────────────────────────────────────────────────────────
+
+save_token() {
+    local access_token="$1" expires_in="$2" refresh_token="${3:-}"
+    local expires_at
+    expires_at=$(( $(date +%s) + expires_in - 300 ))
+    mkdir -p "$CONF_DIR"
+    cat > "$TOKEN_FILE" <<EOF
+ACCESS_TOKEN="${access_token}"
+EXPIRES_AT=${expires_at}
+REFRESH_TOKEN="${refresh_token}"
+EOF
+    chmod 600 "$TOKEN_FILE"
+}
+
+load_token() {
+    [[ -f "$TOKEN_FILE" ]] || die "Not logged in. Run: linkedin-cli login"
+    # shellcheck source=/dev/null
+    source "$TOKEN_FILE"
+    [[ -n "${ACCESS_TOKEN:-}" ]] || die "No access token found. Run: linkedin-cli login"
+}
+
+get_token() {
+    load_token
+    local now
+    now=$(date +%s)
+    if [[ "$now" -ge "${EXPIRES_AT:-0}" ]]; then
+        # Token expired — try refresh
+        if [[ -n "${REFRESH_TOKEN:-}" ]]; then
+            info "Token expired, refreshing..."
+            refresh_access_token
+            load_token
+        else
+            die "Token expired and no refresh token available. Run: linkedin-cli login"
+        fi
+    fi
+    printf '%s' "$ACCESS_TOKEN"
+}
+
+refresh_access_token() {
+    load_config
+    load_token
+    [[ -n "${REFRESH_TOKEN:-}" ]] || die "No refresh token. Run: linkedin-cli login"
+    local r http_code body
+    r=$(curl -sS -w "\n%{http_code}" -X POST "${AUTH_URL}/accessToken" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=refresh_token" \
+        -d "refresh_token=${REFRESH_TOKEN}" \
+        -d "client_id=${LINKEDIN_CLIENT_ID}" \
+        -d "client_secret=${LINKEDIN_CLIENT_SECRET}")
+    body=$(printf '%s' "$r" | sed '$d')
+    http_code=$(printf '%s' "$r" | tail -1)
+    check_http "$http_code" "$body" "refresh"
+    local tok exp ref
+    tok=$(json_str "$body" "access_token")
+    exp=$(json_int "$body" "expires_in")
+    ref=$(json_str "$body" "refresh_token")
+    [[ -n "$tok" ]] || die "Empty access_token in refresh response: $body"
+    save_token "$tok" "${exp:-5184000}" "${ref:-$REFRESH_TOKEN}"
+    info "Token refreshed"
+}
+
+# Start a temporary HTTP server to catch the OAuth callback
+wait_for_callback() {
+    local timeout=120
+    info "Waiting for OAuth callback on port ${REDIRECT_PORT} (${timeout}s timeout)..."
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local response_file="${tmpdir}/response"
+
+    # Use python3 for the HTTP server (available on macOS and most Linux)
+    python3 -c "
+import http.server
+import urllib.parse
+import sys
+import os
+import signal
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        if 'code' in params:
+            code = params['code'][0]
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(b'<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to the terminal.</p></body></html>')
+            with open('${response_file}', 'w') as f:
+                f.write(code)
+            # Schedule shutdown
+            def shutdown():
+                self.server.shutdown()
+            import threading
+            threading.Thread(target=shutdown).start()
+        elif 'error' in params:
+            error = params.get('error', ['unknown'])[0]
+            desc = params.get('error_description', [''])[0]
+            self.send_response(400)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            msg = f'<html><body><h2>Authorization failed</h2><p>{error}: {desc}</p></body></html>'
+            self.wfile.write(msg.encode())
+            with open('${response_file}', 'w') as f:
+                f.write(f'ERROR:{error}:{desc}')
+            def shutdown():
+                self.server.shutdown()
+            import threading
+            threading.Thread(target=shutdown).start()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # Suppress logs
+
+server = http.server.HTTPServer(('127.0.0.1', ${REDIRECT_PORT}), Handler)
+server.timeout = ${timeout}
+signal.signal(signal.SIGALRM, lambda s,f: server.shutdown())
+signal.alarm(${timeout})
+try:
+    server.serve_forever()
+except:
+    pass
+" &
+    local server_pid=$!
+
+    # Wait for server to finish
+    wait "$server_pid" 2>/dev/null || true
+
+    if [[ -f "$response_file" ]]; then
+        local code
+        code=$(cat "$response_file")
+        rm -rf "$tmpdir"
+        if [[ "$code" == ERROR:* ]]; then
+            die "OAuth error: ${code#ERROR:}"
+        fi
+        printf '%s' "$code"
+    else
+        rm -rf "$tmpdir"
+        die "Timeout waiting for OAuth callback. Try again."
+    fi
+}
+
+cmd_login() {
+    load_config
+    local state
+    state=$(date +%s | shasum | head -c 16)
+
+    local scopes="openid%20profile%20w_member_social"
+    local auth_link="${AUTH_URL}/authorization?response_type=code&client_id=${LINKEDIN_CLIENT_ID}&redirect_uri=$(printf '%s' "$REDIRECT_URI" | sed 's/:/%3A/g; s/\//%2F/g')&state=${state}&scope=${scopes}"
+
+    info "Opening authorization URL in browser..."
+    info ""
+    info "If the browser doesn't open, visit this URL manually:"
+    printf '\n  %s\n\n' "$auth_link" >&2
+
+    # Try to open browser
+    if command -v open >/dev/null 2>&1; then
+        open "$auth_link" 2>/dev/null || true
+    elif command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$auth_link" 2>/dev/null || true
+    fi
+
+    # Wait for callback
+    local code
+    code=$(wait_for_callback)
+    [[ -n "$code" ]] || die "No authorization code received"
+
+    info "Got authorization code, exchanging for token..."
+
+    # Exchange code for token
+    local r http_code body
+    r=$(curl -sS -w "\n%{http_code}" -X POST "${AUTH_URL}/accessToken" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "grant_type=authorization_code" \
+        -d "code=${code}" \
+        -d "client_id=${LINKEDIN_CLIENT_ID}" \
+        -d "client_secret=${LINKEDIN_CLIENT_SECRET}" \
+        -d "redirect_uri=${REDIRECT_URI}")
+    body=$(printf '%s' "$r" | sed '$d')
+    http_code=$(printf '%s' "$r" | tail -1)
+    check_http "$http_code" "$body" "token exchange"
+
+    local tok exp ref
+    tok=$(json_str "$body" "access_token")
+    exp=$(json_int "$body" "expires_in")
+    ref=$(json_str "$body" "refresh_token")
+    [[ -n "$tok" ]] || die "Empty access_token: $body"
+
+    save_token "$tok" "${exp:-5184000}" "$ref"
+    info "Login successful! Token saved."
+    info "Token expires in $(( ${exp:-5184000} / 86400 )) days"
+    info "Test with: linkedin-cli whoami"
+}
+
+# ── Who Am I ─────────────────────────────────────────────────────────
+
+cmd_whoami() {
+    local token
+    token=$(get_token)
+
+    local r http_code body
+    r=$(curl -sS -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${token}" \
+        "${API_BASE}/v2/userinfo")
+    body=$(printf '%s' "$r" | sed '$d')
+    http_code=$(printf '%s' "$r" | tail -1)
+    check_http "$http_code" "$body" "whoami"
+
+    local name sub
+    name=$(json_str "$body" "name")
+    sub=$(json_str "$body" "sub")
+
+    if [[ -n "$name" ]]; then
+        info "Logged in as: ${name}"
+        info "User ID (sub): ${sub}"
+    else
+        die "Could not parse user info: $body"
+    fi
+}
+
+# ── Get member URN ───────────────────────────────────────────────────
+
+get_member_urn() {
+    local token="$1"
+    local r http_code body
+    r=$(curl -sS -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${token}" \
+        "${API_BASE}/v2/userinfo")
+    body=$(printf '%s' "$r" | sed '$d')
+    http_code=$(printf '%s' "$r" | tail -1)
+    check_http "$http_code" "$body" "get member"
+
+    local sub
+    sub=$(json_str "$body" "sub")
+    [[ -n "$sub" ]] || die "Could not get user sub: $body"
+    printf '%s' "urn:li:person:${sub}"
+}
+
+# ── Upload image ─────────────────────────────────────────────────────
+
+upload_image() {
+    local file="$1" token="$2" author_urn="$3"
+    [[ -f "$file" ]] || die "File not found: $file"
+
+    info "Registering image upload..."
+
+    # Step 1: Register upload
+    local register_body
+    register_body=$(printf '{
+        "registerUploadRequest": {
+            "recipes": ["urn:li:digitalmediaRecipe:feedshare-image"],
+            "owner": "%s",
+            "serviceRelationships": [{
+                "relationshipType": "OWNER",
+                "identifier": "urn:li:userGeneratedContent"
+            }]
+        }
+    }' "$author_urn")
+
+    local r http_code body
+    r=$(curl -sS -w "\n%{http_code}" -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d "$register_body" \
+        "${API_BASE}/v2/assets?action=registerUpload")
+    body=$(printf '%s' "$r" | sed '$d')
+    http_code=$(printf '%s' "$r" | tail -1)
+    check_http "$http_code" "$body" "register image upload"
+
+    # Extract upload URL and asset URN
+    local upload_url asset_urn
+    if $HAS_JQ; then
+        upload_url=$(printf '%s' "$body" | jq -r '.value.uploadMechanism["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"].uploadUrl // empty')
+        asset_urn=$(printf '%s' "$body" | jq -r '.value.asset // empty')
+    else
+        upload_url=$(printf '%s' "$body" | sed -n 's/.*"uploadUrl"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+        asset_urn=$(printf '%s' "$body" | sed -n 's/.*"asset"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+
+    [[ -n "$upload_url" ]] || die "No upload URL in response: $body"
+    [[ -n "$asset_urn" ]]  || die "No asset URN in response: $body"
+
+    info "Uploading image binary..."
+
+    # Step 2: Upload binary
+    r=$(curl -sS -w "\n%{http_code}" -X PUT \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/octet-stream" \
+        --data-binary "@${file}" \
+        "$upload_url")
+    body=$(printf '%s' "$r" | sed '$d')
+    http_code=$(printf '%s' "$r" | tail -1)
+    # Upload returns 201 on success with empty body
+    if [[ "$http_code" -ge 400 ]]; then
+        check_http "$http_code" "$body" "upload image binary"
+    fi
+
+    info "Image uploaded: ${asset_urn}"
+    printf '%s' "$asset_urn"
+}
+
+# ── Publish post ─────────────────────────────────────────────────────
+
+cmd_publish() {
+    local text="" visibility="PUBLIC" images=() article=false title="" url="" thumbnail=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --text)       text="$2";       shift 2;;
+            --visibility) visibility=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]');
+                          case "$visibility" in
+                              PUBLIC|CONNECTIONS) ;;
+                              *) die "Invalid visibility: $2 (use: public or connections)";;
+                          esac
+                          shift 2;;
+            --images)     shift
+                          while [[ $# -gt 0 && "$1" != --* ]]; do
+                              images+=("$1")
+                              shift
+                          done;;
+            --article)    article=true;     shift;;
+            --title)      title="$2";       shift 2;;
+            --url)        url="$2";         shift 2;;
+            --thumbnail)  thumbnail="$2";   shift 2;;
+            *) die "Unknown option: $1";;
+        esac
+    done
+
+    [[ -n "$text" ]] || die "--text is required"
+
+    local token
+    token=$(get_token)
+
+    local author_urn
+    author_urn=$(get_member_urn "$token")
+
+    # Handle image uploads
+    local image_urns=()
+    for img in "${images[@]+"${images[@]}"}"; do
+        local urn
+        urn=$(upload_image "$img" "$token" "$author_urn")
+        image_urns+=("$urn")
+    done
+
+    # Handle thumbnail upload for articles
+    local thumb_urn=""
+    if [[ -n "$thumbnail" ]]; then
+        thumb_urn=$(upload_image "$thumbnail" "$token" "$author_urn")
+    fi
+
+    # Build the post JSON via temp file (avoids quoting issues)
+    local escaped_text escaped_title
+    escaped_text=$(json_escape "$text")
+    escaped_title=$(json_escape "$title")
+
+    local tmpjson
+    tmpjson=$(mktemp)
+    trap "rm -f '$tmpjson'" EXIT
+
+    if $article && [[ -n "$url" ]]; then
+        # Article share (link with optional title and thumbnail)
+        local media_obj
+        media_obj="{\"status\":\"READY\",\"originalUrl\":\"${url}\""
+        [[ -n "$title" ]] && media_obj="${media_obj},\"title\":{\"text\":\"${escaped_title}\"}"
+        [[ -n "$thumb_urn" ]] && media_obj="${media_obj},\"thumbnails\":[{\"resolvedUrl\":\"${thumb_urn}\"}]"
+        media_obj="${media_obj}}"
+
+        cat > "$tmpjson" <<ENDJSON
+{
+  "author": "${author_urn}",
+  "lifecycleState": "PUBLISHED",
+  "specificContent": {
+    "com.linkedin.ugc.ShareContent": {
+      "shareCommentary": {"text": "${escaped_text}"},
+      "shareMediaCategory": "ARTICLE",
+      "media": [${media_obj}]
+    }
+  },
+  "visibility": {
+    "com.linkedin.ugc.MemberNetworkVisibility": "${visibility}"
+  }
+}
+ENDJSON
+    elif [[ ${#image_urns[@]} -gt 0 ]]; then
+        # Post with images
+        local media_json=""
+        for urn in "${image_urns[@]}"; do
+            [[ -n "$media_json" ]] && media_json="${media_json},"
+            media_json="${media_json}{\"status\":\"READY\",\"media\":\"${urn}\"}"
+        done
+
+        cat > "$tmpjson" <<ENDJSON
+{
+  "author": "${author_urn}",
+  "lifecycleState": "PUBLISHED",
+  "specificContent": {
+    "com.linkedin.ugc.ShareContent": {
+      "shareCommentary": {"text": "${escaped_text}"},
+      "shareMediaCategory": "IMAGE",
+      "media": [${media_json}]
+    }
+  },
+  "visibility": {
+    "com.linkedin.ugc.MemberNetworkVisibility": "${visibility}"
+  }
+}
+ENDJSON
+    else
+        # Text-only post
+        cat > "$tmpjson" <<ENDJSON
+{
+  "author": "${author_urn}",
+  "lifecycleState": "PUBLISHED",
+  "specificContent": {
+    "com.linkedin.ugc.ShareContent": {
+      "shareCommentary": {"text": "${escaped_text}"},
+      "shareMediaCategory": "NONE"
+    }
+  },
+  "visibility": {
+    "com.linkedin.ugc.MemberNetworkVisibility": "${visibility}"
+  }
+}
+ENDJSON
+    fi
+
+    info "Publishing to LinkedIn..."
+
+    local r http_code body
+    r=$(curl -sS -w "\n%{http_code}" -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -H "X-Restli-Protocol-Version: 2.0.0" \
+        --data-binary "@${tmpjson}" \
+        "${API_BASE}/v2/ugcPosts")
+    rm -f "$tmpjson"
+    body=$(printf '%s' "$r" | sed '$d')
+    http_code=$(printf '%s' "$r" | tail -1)
+    check_http "$http_code" "$body" "publish"
+
+    local post_id
+    post_id=$(json_str "$body" "id")
+    if [[ -z "$post_id" ]]; then
+        # UGC Posts API returns the ID in the header; for 201 responses, the body may contain it
+        # Try alternative extraction
+        if $HAS_JQ; then
+            post_id=$(printf '%s' "$body" | jq -r '.id // empty' 2>/dev/null)
+        fi
+    fi
+
+    info "Published!"
+    if [[ -n "$post_id" ]]; then
+        info "Post ID: ${post_id}"
+        echo "$post_id"
+    else
+        info "Post created (HTTP ${http_code})"
+        echo "ok"
+    fi
+}
+
+# ── Token status ─────────────────────────────────────────────────────
+
+cmd_token() {
+    if [[ ! -f "$TOKEN_FILE" ]]; then
+        info "No token found. Run: linkedin-cli login"
+        return 1
+    fi
+
+    load_token
+    local now exp_date remaining_days
+    now=$(date +%s)
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        exp_date=$(date -r "${EXPIRES_AT:-0}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown")
+    else
+        exp_date=$(date -d "@${EXPIRES_AT:-0}" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown")
+    fi
+
+    if [[ "$now" -ge "${EXPIRES_AT:-0}" ]]; then
+        info "Token status: EXPIRED"
+        info "Expired at: ${exp_date}"
+        if [[ -n "${REFRESH_TOKEN:-}" ]]; then
+            info "Refresh token: available (run any command to auto-refresh)"
+        else
+            info "Refresh token: none (run: linkedin-cli login)"
+        fi
+    else
+        remaining_days=$(( (EXPIRES_AT - now) / 86400 ))
+        local remaining_hours=$(( (EXPIRES_AT - now) % 86400 / 3600 ))
+        info "Token status: VALID"
+        info "Expires at: ${exp_date}"
+        info "Remaining: ${remaining_days}d ${remaining_hours}h"
+        if [[ -n "${REFRESH_TOKEN:-}" ]]; then
+            info "Refresh token: available"
+        else
+            info "Refresh token: none"
+        fi
+    fi
+    # Print masked token for debugging
+    local masked
+    if [[ ${#ACCESS_TOKEN} -gt 12 ]]; then
+        masked="${ACCESS_TOKEN:0:6}...${ACCESS_TOKEN: -6}"
+    else
+        masked="***"
+    fi
+    info "Token: ${masked}"
+}
+
+# ── Usage ────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'USAGE'
+linkedin-cli — LinkedIn post/article publishing tool
+
+Commands:
+  init                          Create config file (~/.config/linkedin-cli/config)
+  login                         OAuth 2.0 authorization flow
+  whoami                        Show current user info
+  token                         Show token status and expiry
+  publish --text "content"      Publish a text post
+    [--images img1.png img2.png]  Attach images
+    [--visibility public|connections]
+  publish --article --title "Title" --text "Body" --url "https://..."
+    [--thumbnail thumb.png]     Publish an article share
+
+Typical workflow:
+  linkedin-cli init
+  # Edit ~/.config/linkedin-cli/config with your credentials
+  linkedin-cli login
+  linkedin-cli whoami
+  linkedin-cli publish --text "Hello LinkedIn!"
+  linkedin-cli publish --text "Check this out" --images photo.png
+  linkedin-cli publish --article --title "My Article" --text "Summary" --url "https://example.com"
+
+Config:  ~/.config/linkedin-cli/config
+Token:   ~/.config/linkedin-cli/token
+USAGE
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    init)     cmd_init;;
+    login)    cmd_login;;
+    whoami)   cmd_whoami;;
+    token)    cmd_token;;
+    publish)  shift; cmd_publish "$@";;
+    -h|--help|help) usage;;
+    *)        die "Unknown: $1 (try: linkedin-cli help)";;
+esac

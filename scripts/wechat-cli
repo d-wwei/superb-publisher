@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# wechat-cli — WeChat Official Account publishing tool
+# Zero dependencies beyond curl (macOS/Linux built-in)
+set -euo pipefail
+
+CONF_DIR="${HOME}/.config/wechat-cli"
+CONF_FILE="${CONF_DIR}/config"
+TOKEN_CACHE="${CONF_DIR}/token"
+API="https://api.weixin.qq.com/cgi-bin"
+
+die()  { printf '\033[31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m→\033[0m %s\n' "$*" >&2; }
+
+# ── JSON helpers (pure awk/sed, no jq/python) ────────────────────────
+
+json_str() {
+    printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+json_int() {
+    printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9-]*\).*/\1/p" | head -1
+}
+
+json_escape_file() {
+    awk 'BEGIN{ORS=""} {
+        gsub(/\\/, "\\\\")
+        gsub(/"/, "\\\"")
+        gsub(/\t/, "\\t")
+        gsub(/\r/, "")
+        if (NR > 1) printf "\\n"
+        print
+    }' "$1"
+}
+
+explain_err() {
+    case "$1" in
+        -1)     echo "系统繁忙，请稍后重试";;
+        40001)  echo "AppSecret 错误或 access_token 无效，请检查配置";;
+        40002)  echo "不合法的凭证类型";;
+        40014)  echo "access_token 不合法，请运行 wechat-cli token 刷新";;
+        40125)  echo "无效的 AppSecret，请检查 ~/.config/wechat-cli/config";;
+        41001)  echo "缺少 access_token 参数";;
+        42001)  echo "access_token 已过期，请重新获取";;
+        43004)  echo "需要关注公众号后才能操作";;
+        45009)  echo "素材数量超限（图片 5000/语音视频 1000），请先删除旧素材";;
+        45028)  echo "草稿数量超过上限，请先删除旧草稿";;
+        45064)  echo "创建草稿异常，内容可能不合规";;
+        45065)  echo "草稿内容格式异常";;
+        45066)  echo "草稿内容包含外部链接";;
+        45067)  echo "草稿内容包含不安全内容";;
+        48001)  echo "API 功能未授权，请确认公众号已认证且开通了该接口权限";;
+        48004)  echo "API 调用超限，请明天再试";;
+        48006)  echo "API 调用被禁止，检查公众号是否被封";;
+        50002)  echo "用户受限，无法操作";;
+        61023)  echo "IP 不在白名单，请在公众号后台添加本机 IP";;
+        *)      echo "";;
+    esac
+}
+
+check_err() {
+    local resp="$1" ctx="$2"
+    local code
+    code=$(json_int "$resp" "errcode")
+    if [[ -n "$code" && "$code" != "0" ]]; then
+        local hint
+        hint=$(explain_err "$code")
+        if [[ -n "$hint" ]]; then
+            die "${ctx}: [${code}] ${hint}"
+        else
+            die "${ctx}: [${code}] $(json_str "$resp" "errmsg")"
+        fi
+    fi
+}
+
+# ── Config ───────────────────────────────────────────────────────────
+
+load_config() {
+    [[ -f "$CONF_FILE" ]] || die "Config not found. Run: wechat-cli init"
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+    [[ -n "${WECHAT_APPID:-}" ]]  || die "WECHAT_APPID empty in $CONF_FILE"
+    [[ -n "${WECHAT_SECRET:-}" ]] || die "WECHAT_SECRET empty in $CONF_FILE"
+}
+
+cmd_init() {
+    mkdir -p "$CONF_DIR"
+    if [[ -f "$CONF_FILE" ]]; then
+        info "Config already exists: $CONF_FILE"
+        return
+    fi
+    cat > "$CONF_FILE" <<'EOF'
+WECHAT_APPID=""
+WECHAT_SECRET=""
+EOF
+    chmod 600 "$CONF_FILE"
+    info "Created: $CONF_FILE"
+    info "Fill in AppID and AppSecret, then test with: wechat-cli token"
+}
+
+# ── Token (auto-cached, 2h TTL with 5min buffer) ────────────────────
+
+get_token() {
+    # Try cache first
+    if [[ -f "$TOKEN_CACHE" ]]; then
+        local tok exp
+        tok=$(sed -n '1p' "$TOKEN_CACHE")
+        exp=$(sed -n '2p' "$TOKEN_CACHE")
+        if [[ $(date +%s) -lt "${exp:-0}" ]]; then
+            printf '%s' "$tok"
+            return
+        fi
+    fi
+    # Fetch fresh token
+    load_config
+    local r
+    r=$(curl -sS "${API}/token?grant_type=client_credential&appid=${WECHAT_APPID}&secret=${WECHAT_SECRET}")
+    check_err "$r" "token"
+    local tok ttl
+    tok=$(json_str "$r" "access_token")
+    ttl=$(json_int "$r" "expires_in")
+    [[ -n "$tok" ]] || die "Empty access_token: $r"
+    mkdir -p "$CONF_DIR"
+    printf '%s\n%s\n' "$tok" "$(( $(date +%s) + ttl - 300 ))" > "$TOKEN_CACHE"
+    chmod 600 "$TOKEN_CACHE"
+    printf '%s' "$tok"
+}
+
+# ── Upload article image → WeChat CDN URL ───────────────────────────
+
+cmd_upload_img() {
+    local f="${1:?Usage: wechat-cli upload-img <file>}"
+    [[ -f "$f" ]] || die "Not found: $f"
+    load_config
+    local token r
+    token=$(get_token)
+    r=$(curl -sS -F "media=@${f}" "${API}/media/uploadimg?access_token=${token}")
+    check_err "$r" "upload-img"
+    local url
+    url=$(json_str "$r" "url")
+    [[ -n "$url" ]] || die "No URL in response: $r"
+    echo "$url"
+}
+
+# ── Upload cover image → permanent media_id ─────────────────────────
+
+cmd_upload_thumb() {
+    local f="${1:?Usage: wechat-cli upload-thumb <file>}"
+    [[ -f "$f" ]] || die "Not found: $f"
+    load_config
+    local token r
+    token=$(get_token)
+    r=$(curl -sS -F "media=@${f}" "${API}/material/add_material?access_token=${token}&type=thumb")
+    check_err "$r" "upload-thumb"
+    local mid
+    mid=$(json_str "$r" "media_id")
+    [[ -n "$mid" ]] || die "No media_id: $r"
+    echo "$mid"
+}
+
+# ── Batch-upload local images in HTML & replace src with CDN URLs ────
+
+cmd_upload_images() {
+    local f="${1:?Usage: wechat-cli upload-images <html-file>}"
+    [[ -f "$f" ]] || die "Not found: $f"
+    load_config
+    local basedir
+    basedir=$(cd "$(dirname "$f")" && pwd)
+
+    # Find local image paths (skip http, https, data:, //)
+    local imgs
+    imgs=$(grep -oE 'src="[^"]*"' "$f" | sed 's/src="//;s/"$//' \
+        | grep -vE '^(https?://|data:|//)' | sort -u) || true
+
+    if [[ -z "$imgs" ]]; then
+        info "No local images found"
+        return
+    fi
+
+    local count=0
+    while IFS= read -r img; do
+        local full
+        if [[ "$img" = /* ]]; then
+            full="$img"
+        else
+            full="${basedir}/${img}"
+        fi
+        if [[ -f "$full" ]]; then
+            info "Uploading: $img"
+            local url
+            url=$(cmd_upload_img "$full")
+            # Replace in HTML (using | delimiter to avoid path conflicts)
+            sed "s|${img}|${url}|g" "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
+            info "  ${url}"
+            count=$((count + 1))
+        else
+            info "SKIP (not found): $full"
+        fi
+    done <<< "$imgs"
+    info "Done — ${count} image(s) uploaded"
+}
+
+# ── Pre-publish check ────────────────────────────────────────────────
+
+cmd_check() {
+    local f="${1:?Usage: wechat-cli check <html-file>}"
+    [[ -f "$f" ]] || die "Not found: $f"
+
+    local warns=0 errors=0
+
+    # Title: look for <h1> or <title>
+    if ! grep -qE '<h[12][^>]*>' "$f"; then
+        printf '\033[33mWARN:\033[0m  No <h1>/<h2> found — article may lack a visible title\n' >&2
+        warns=$((warns + 1))
+    fi
+
+    # Local images not yet uploaded
+    local local_imgs
+    local_imgs=$(grep -oE 'src="[^"]*"' "$f" | sed 's/src="//;s/"$//' \
+        | grep -vE '^(https?://|data:|//)' | head -20) || true
+    if [[ -n "$local_imgs" ]]; then
+        local img_count
+        img_count=$(echo "$local_imgs" | wc -l | tr -d ' ')
+        printf '\033[31mFAIL:\033[0m  %s local image(s) not uploaded to WeChat CDN\n' "$img_count" >&2
+        echo "$local_imgs" | while IFS= read -r img; do
+            printf '         %s\n' "$img" >&2
+        done
+        printf '         Run: wechat-cli upload-images %s\n' "$f" >&2
+        errors=$((errors + 1))
+    fi
+
+    # External links (non-weixin.qq.com <a> tags)
+    local ext_links
+    ext_links=$(grep -oE '<a [^>]*href="https?://[^"]*"' "$f" \
+        | grep -v 'weixin.qq.com' | grep -v 'mp.weixin.qq.com' | head -10) || true
+    if [[ -n "$ext_links" ]]; then
+        local link_count
+        link_count=$(echo "$ext_links" | wc -l | tr -d ' ')
+        printf '\033[33mWARN:\033[0m  %s external link(s) — WeChat blocks non-weixin URLs\n' "$link_count" >&2
+        warns=$((warns + 1))
+    fi
+
+    # <style> tags (WeChat strips them)
+    if grep -q '<style' "$f"; then
+        printf '\033[33mWARN:\033[0m  <style> tag found — WeChat will strip it, use inline styles\n' >&2
+        warns=$((warns + 1))
+    fi
+
+    # <script> tags
+    if grep -q '<script' "$f"; then
+        printf '\033[33mWARN:\033[0m  <script> tag found — WeChat will strip it\n' >&2
+        warns=$((warns + 1))
+    fi
+
+    # <pre> tags (WeChat renders abnormally)
+    if grep -q '<pre' "$f"; then
+        printf '\033[33mWARN:\033[0m  <pre> tag found — WeChat renders <pre> abnormally, use <section> instead\n' >&2
+        warns=$((warns + 1))
+    fi
+
+    # Pure black #000000 (WeChat swallows it)
+    if grep -qE '#000000|rgb\(0,\s*0,\s*0\)' "$f"; then
+        printf '\033[33mWARN:\033[0m  #000000 / rgb(0,0,0) found — WeChat may hide it, use #3f3f3f\n' >&2
+        warns=$((warns + 1))
+    fi
+
+    # Empty content
+    local size
+    size=$(wc -c < "$f" | tr -d ' ')
+    if [[ "$size" -lt 100 ]]; then
+        printf '\033[31mFAIL:\033[0m  File too small (%s bytes) — likely empty or incomplete\n' "$size" >&2
+        errors=$((errors + 1))
+    fi
+
+    # Summary
+    if [[ $errors -eq 0 && $warns -eq 0 ]]; then
+        printf '\033[32mPASS:\033[0m  All checks passed — ready to publish\n' >&2
+    elif [[ $errors -eq 0 ]]; then
+        printf '\033[33mPASS:\033[0m  %s warning(s), no blocking issues\n' "$warns" >&2
+    else
+        printf '\033[31mFAIL:\033[0m  %s error(s), %s warning(s) — fix errors before publishing\n' "$errors" "$warns" >&2
+        exit 1
+    fi
+}
+
+# ── Create draft → media_id ─────────────────────────────────────────
+
+cmd_draft() {
+    local title="" html="" thumb="" author="" digest="" from_json=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title)     title="$2";     shift 2;;
+            --html)      html="$2";      shift 2;;
+            --thumb)     thumb="$2";     shift 2;;
+            --author)    author="$2";    shift 2;;
+            --digest)    digest="$2";    shift 2;;
+            --from-json) from_json="$2"; shift 2;;
+            *) die "Unknown option: $1";;
+        esac
+    done
+
+    load_config
+    local token
+    token=$(get_token)
+
+    local tmp
+    tmp=$(mktemp)
+
+    if [[ -n "$from_json" ]]; then
+        # Direct JSON mode: use pre-built draft JSON file as-is
+        [[ -f "$from_json" ]] || die "JSON file not found: $from_json"
+        cp "$from_json" "$tmp"
+    else
+        # Build from flags
+        [[ -n "$title" ]]              || die "--title required (or use --from-json)"
+        [[ -n "$html" && -f "$html" ]] || die "--html <file> required (or use --from-json)"
+
+        # Escape text fields for JSON
+        local e_title e_author e_digest
+        e_title=$(printf '%s' "$title" | awk '{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); printf "%s", $0}')
+        e_author=$(printf '%s' "$author" | awk '{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); printf "%s", $0}')
+        e_digest=$(printf '%s' "$digest" | awk '{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); printf "%s", $0}')
+
+        # Build JSON body (streams HTML content, handles large files)
+        {
+            printf '{"articles":[{"title":"%s","author":"%s","digest":"%s","content":"' \
+                "$e_title" "$e_author" "$e_digest"
+            json_escape_file "$html"
+            printf '","thumb_media_id":"%s","need_open_comment":0,"only_fans_can_comment":0}]}' \
+                "$thumb"
+        } > "$tmp"
+    fi
+
+    local r
+    r=$(curl -sS -X POST "${API}/draft/add?access_token=${token}" \
+        -H "Content-Type: application/json" \
+        --data-binary "@${tmp}")
+    rm -f "$tmp"
+    check_err "$r" "draft"
+
+    local mid
+    mid=$(json_str "$r" "media_id")
+    [[ -n "$mid" ]] || die "No media_id: $r"
+    info "Draft created"
+    echo "$mid"
+}
+
+# ── Publish draft ────────────────────────────────────────────────────
+
+cmd_publish() {
+    local mid="${1:?Usage: wechat-cli publish <media_id>}"
+    load_config
+    local token r
+    token=$(get_token)
+    r=$(curl -sS -X POST "${API}/freepublish/submit?access_token=${token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"media_id\":\"${mid}\"}")
+    check_err "$r" "publish"
+    local pid
+    pid=$(json_str "$r" "publish_id")
+    [[ -z "$pid" ]] && pid=$(json_int "$r" "publish_id")
+    info "Published"
+    echo "${pid:-ok}"
+}
+
+# ── Check publish status ────────────────────────────────────────────
+
+cmd_status() {
+    local pid="${1:?Usage: wechat-cli status <publish_id>}"
+    load_config
+    local token
+    token=$(get_token)
+    curl -sS -X POST "${API}/freepublish/get?access_token=${token}" \
+        -H "Content-Type: application/json" \
+        -d "{\"publish_id\":\"${pid}\"}"
+    echo
+}
+
+# ── Usage ────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<'USAGE'
+wechat-cli — WeChat Official Account publishing tool
+
+Commands:
+  init                          Create config file
+  token                         Show / refresh access token
+  upload-img    <file>          Upload article image → CDN URL
+  upload-thumb  <file>          Upload cover image → media_id
+  upload-images <html>          Batch-upload local images in HTML, replace URLs
+  check  <html>                 Pre-publish readiness check
+  draft  --title T --html F [--thumb ID] [--author A] [--digest D]
+                                Create draft → media_id
+  draft  --from-json <file>     Create draft from pre-built JSON file
+  publish  <media_id>           Publish draft → publish_id
+  status   <publish_id>         Check publish status
+
+Typical workflow:
+  wechat-cli check article.html
+  wechat-cli upload-images article.html
+  wechat-cli draft --title "标题" --html article.html --thumb THUMB_ID
+  wechat-cli publish MEDIA_ID
+
+Config: ~/.config/wechat-cli/config
+USAGE
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+case "${1:-help}" in
+    init)           cmd_init;;
+    token)          load_config; get_token; echo;;
+    upload-img)     shift; cmd_upload_img "$@";;
+    upload-thumb)   shift; cmd_upload_thumb "$@";;
+    upload-images)  shift; cmd_upload_images "$@";;
+    check)          shift; cmd_check "$@";;
+    draft)          shift; cmd_draft "$@";;
+    publish)        shift; cmd_publish "$@";;
+    status)         shift; cmd_status "$@";;
+    -h|--help|help) usage;;
+    *)              die "Unknown: $1 (try: wechat-cli help)";;
+esac
