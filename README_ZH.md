@@ -1,6 +1,75 @@
 # Superb Publisher
 
-面向 AI Agent 流水线的多平台社交媒体发布工具包。通过统一 CLI 接口将内容路由到 6 个平台。
+一个 AI agent 技能，通过统一 CLI 接口将内容发布到 6 个社交平台。
+
+[English](README.md)
+
+---
+
+## 解决什么问题
+
+用 AI 写完文章后，你需要发到微信公众号、Medium、LinkedIn、小红书、抖音、X。每个平台的 API、认证方式、内容格式、字数限制都不一样。
+
+Superb Publisher 给 AI agent 一个 `/publish` 命令。agent 说发哪里，skill 负责怎么发。
+
+---
+
+## 快速开始
+
+```bash
+git clone https://github.com/d-wwei/superb-publisher.git
+cd superb-publisher
+
+# 浏览器类 CLI（小红书、抖音、X）需要一次性构建：
+npm install && npm run build
+
+# API 类 CLI（微信、Medium、LinkedIn）直接可用，零依赖。
+```
+
+以 Medium 为例设置一个平台：
+
+```bash
+scripts/medium-cli init
+# 编辑 ~/.config/medium-cli/config，填入 Integration Token
+# 获取 Token：https://medium.com/me/settings/security
+
+scripts/medium-cli publish --title "我的文章" --html article.html --status draft
+```
+
+---
+
+## 核心功能
+
+**一条命令发布到任一平台：**
+
+```
+/publish --platform medium --title "我的文章" --html article.html
+```
+
+**多平台同时发布：**
+
+```
+/publish --platform wechat,medium,x --title "我的文章" --html article.html
+```
+
+每个平台独立确认，单个失败不影响其他平台，最终输出汇总报告。
+
+**按平台适配不同内容类型：**
+
+- 长文 HTML 发到微信公众号和 Medium
+- 文字 + 图片发到 LinkedIn 和小红书
+- 视频发到抖音
+- 推文、推文串、长文章发到 X/Twitter
+
+**兼容所有 AI agent** — Claude Code、Codex、Gemini CLI、Cursor 等。agent 通过 Bash 调用 shell 命令，无需引入 SDK。
+
+**接入 crisp-articulator 流水线**，作为发布环节：
+
+```
+写作 (great-writer) -> 配图 (brilliant-visualizer) -> 排版 (excellent-typesetter) -> 交付 -> 发布 (superb-publisher)
+```
+
+---
 
 ## 支持平台
 
@@ -8,188 +77,133 @@
 |------|-----|------|----------|
 | 微信公众号 | `scripts/wechat-cli` | API (bash + curl) | AppID + AppSecret |
 | Medium | `scripts/medium-cli` | API (bash + curl) | Integration Token |
-| LinkedIn | `scripts/linkedin-cli` | API (bash + curl + OAuth) | OAuth 2.0 |
-| 小红书 | `bin/xhs-cli` | 浏览器自动化 | 扫码登录 |
-| 抖音 | `bin/douyin-cli` | 浏览器自动化 | 扫码登录 |
-| X / Twitter | `bin/x-cli` | 浏览器自动化 | 邮箱密码登录 |
+| LinkedIn | `scripts/linkedin-cli` | API (bash + curl) | OAuth 2.0 |
+| 小红书 | `bin/xhs-cli` | 浏览器自动化 (Puppeteer) | 扫码登录 |
+| 抖音 | `bin/douyin-cli` | 浏览器自动化 (Puppeteer) | 扫码登录 |
+| X / Twitter | `bin/x-cli` | 浏览器自动化 (Puppeteer) | 邮箱密码登录 |
 
-## 项目结构
+### 各平台限制
 
-```
-superb-publisher/
-  scripts/            # API 类 CLI（纯 bash 脚本，零依赖）
-    wechat-cli
-    medium-cli
-    linkedin-cli
-  core/               # 共享浏览器自动化基础设施
-  platforms/          # 各平台浏览器自动化包
-    xhs/
-    douyin/
-    x/
-  bin/                # 浏览器类 CLI 入口
-    xhs-cli
-    douyin-cli
-    x-cli
-  SKILL.md            # AI Agent 技能定义文件
-```
+| 平台 | 标题 | 正文 | 图片 | 视频 |
+|------|------|------|------|------|
+| 微信公众号 | 必填 | HTML，无大小限制 | 内嵌，需上传至 CDN | 不支持 |
+| Medium | 必填 | HTML 或 Markdown，无限制 | 内嵌（自动转存） | 不支持 |
+| LinkedIn | 包含在正文中 | 建议 ~1300 字符以内 | 最多 ~20 张 | 不支持 |
+| 小红书 | 最多 20 字 | 最多 1000 字，纯文本 | 1-18 张 | 可选 |
+| 抖音 | 最多 55 字 | 描述文字 | 最多 35 张 | 支持 |
+| X/Twitter | 无（推文） | 280 字符（标准），25000（Premium） | 最多 4 张 | 可选 |
 
-两类 CLI：
-- **API 类**（`scripts/`）：纯 bash + curl，零依赖，开箱即用。
-- **浏览器类**（`bin/`）：TypeScript + Puppeteer，首次需要 `npm install`。
+---
 
-## 快速开始
+## 平台配置
 
-### 安装
-
-```bash
-# 克隆项目
-git clone <repo-url> superb-publisher
-cd superb-publisher
-
-# 浏览器类 CLI 需要安装 Node.js 依赖（仅首次）
-npm install
-npm run build
-```
-
-API 类 CLI（`scripts/`）无需安装。
+API 类 CLI（`scripts/`）无需构建。浏览器类 CLI（`bin/`）需要 Node.js 18+ 并执行一次 `npm install && npm run build`。
 
 ### 微信公众号
 
 ```bash
-# 初始化配置
 scripts/wechat-cli init
 # 编辑 ~/.config/wechat-cli/config，填入 AppID 和 AppSecret
-# 重要：在公众号后台 > 设置与开发 > 安全中心 > IP 白名单 中添加本机公网 IP
-
-# 发布流程
-scripts/wechat-cli check article.html           # 预检查
-scripts/wechat-cli upload-images article.html    # 上传图片到微信 CDN
-MEDIA_ID=$(scripts/wechat-cli draft --title "标题" --html article.html)  # 创建草稿
-scripts/wechat-cli publish "$MEDIA_ID"           # 发布
+# 在公众号后台 > 设置与开发 > 安全中心 > IP 白名单 添加本机公网 IP
+scripts/wechat-cli token   # 验证
 ```
 
 ### Medium
 
 ```bash
-# 初始化配置
 scripts/medium-cli init
 # 编辑 ~/.config/medium-cli/config，填入 Integration Token
 # 获取 Token：https://medium.com/me/settings/security
-
-# 发布
-scripts/medium-cli publish --title "我的文章" --html article.html --tags "AI,Tech" --status draft
+scripts/medium-cli whoami   # 验证
 ```
 
 ### LinkedIn
 
 ```bash
-# 初始化配置
 scripts/linkedin-cli init
 # 编辑 ~/.config/linkedin-cli/config，填入 client_id 和 client_secret
 # 获取凭据：https://www.linkedin.com/developers/apps
 # 在 Authorized Redirect URLs 添加 http://localhost:8585/callback
-scripts/linkedin-cli login    # 打开浏览器进行 OAuth 授权
-
-# 发布文字帖
-scripts/linkedin-cli publish --text "分享我的最新文章"
-
-# 带图片
-scripts/linkedin-cli publish --text "附图发布" --images photo1.png photo2.png
-
-# 分享文章链接
-scripts/linkedin-cli publish --article --title "标题" --text "摘要" --url "https://..."
+scripts/linkedin-cli login   # 打开浏览器进行 OAuth 授权
+scripts/linkedin-cli whoami  # 验证
 ```
 
 ### 小红书
 
 ```bash
-# 扫码登录
-bin/xhs-cli login
-
-# 发布图文笔记
-bin/xhs-cli publish --title "我的笔记" --content "正文内容" --images img1.png img2.png
-
-# 从 HTML 发布（自动提取纯文本）
-bin/xhs-cli publish --title "我的笔记" --html article.html --images img1.png
-
-# 发布视频
-bin/xhs-cli publish --title "视频标题" --video clip.mp4 --cover cover.png
-
-# 带标签
-bin/xhs-cli publish --title "笔记" --content "正文" --images img.png --tags "旅行,美食"
+bin/xhs-cli login   # 打开浏览器，用小红书 App 扫码
+bin/xhs-cli check   # 验证
 ```
 
 ### 抖音
 
 ```bash
-# 扫码登录
-bin/douyin-cli login
-
-# 发布视频
-bin/douyin-cli publish --title "我的视频" --video clip.mp4 --cover cover.png --tags "科技"
-
-# 发布图文
-bin/douyin-cli publish --title "图文内容" --images img1.png img2.png --content "描述文字"
+bin/douyin-cli login   # 打开浏览器，用抖音 App 扫码
+bin/douyin-cli check   # 验证
 ```
 
 ### X / Twitter
 
 ```bash
-# 邮箱密码登录
-bin/x-cli login
-
-# 发推
-bin/x-cli publish --text "Hello world"
-
-# 带图片
-bin/x-cli publish --text "看看这个" --images photo1.png photo2.png
-
-# 发布推文串
-bin/x-cli thread --texts "第一条" "第二条" "第三条"
-
-# 长文章（Premium 功能）
-bin/x-cli article --title "我的文章" --md article.md
+bin/x-cli login   # 打开浏览器，邮箱密码登录
+bin/x-cli check   # 验证
 ```
 
-## AI Agent 集成
+---
 
-本工具包设计为 AI Agent 的发布技能。`SKILL.md` 定义了完整接口，兼容 Claude Code、Codex、Gemini CLI 等所有 Agent。
-
-```bash
-# 在任意 AI Agent 流水线中使用：
-bin/xhs-cli check || bin/xhs-cli login
-bin/xhs-cli publish --title "$TITLE" --content "$CONTENT" --images $IMAGES
-```
-
-### 与 crisp-articulator 集成
-
-Superb Publisher 是 [crisp-articulator](../crisp-articulator/) 内容流水线的发布环节：
+## 项目结构
 
 ```
-写作 -> 配图 -> 排版 -> 交付 -> [发布]
+superb-publisher/
+  SKILL.md              # AI agent 技能定义（入口文件）
+  scripts/              # API 类 CLI — 纯 bash + curl，零依赖
+    wechat-cli
+    medium-cli
+    linkedin-cli
+  core/                 # 共享浏览器自动化基础设施（TypeScript）
+  platforms/            # 各平台浏览器自动化实现
+    xhs/
+    douyin/
+    x/
+  bin/                  # 浏览器类 CLI 入口
+    xhs-cli
+    douyin-cli
+    x-cli
+  references/           # Agent 按需读取的参考文档
+    platforms.md        # 各平台 CLI 详细命令
+    setup-guide.md      # 首次配置指南
+    content-adapt.md    # 内容格式转换工具
 ```
 
-当 crisp-articulator 使用 `--publish --platform wechat,medium,x` 调用时，会依次调用本工具包的 CLI 发布到各平台。
+两类 CLI：
 
-## CLI 设计原则
+- **API 类**（`scripts/`）：纯 bash + curl，零依赖。任何装有 curl 的 macOS/Linux 机器都能用。
+- **浏览器类**（`bin/`）：TypeScript + Puppeteer，自动化没有公开 API 的平台。首次需 `npm install`。
 
-所有 CLI 遵循统一规范：
+### CLI 设计规范
 
-- **结构化输出**：stdout 输出 `PUBLISH_SUCCESS` / `PUBLISH_FAILED`，机器可读。
+所有 CLI 遵循统一契约：
+
+- **结构化输出**：stdout 输出 `PUBLISH_SUCCESS` / `PUBLISH_FAILED`，机器可解析。
 - **退出码**：0 = 成功，1 = 失败。
 - **配置隔离**：API 凭据在 `~/.config/{cli}/config`，浏览器 Cookie 在 `~/.config/social-cli/{platform}/cookies.json`，均为 chmod 600。
 - **零上下文开销**：通过 Bash 工具调用，仅命令和输出出现在 AI 对话中。
 
-## 各平台限制
+---
 
-| 平台 | 标题 | 正文 | 图片 | 视频 |
-|------|------|------|------|------|
-| 微信公众号 | 必需 | HTML，无大小限制 | 内嵌，需上传至 CDN | 不支持 |
-| Medium | 必需 | HTML/Markdown，无限制 | 内嵌（自动转存） | 不支持 |
-| LinkedIn | 包含在正文中 | 建议 ~1300 字符以内 | 最多 ~20 张 | 不支持 |
-| 小红书 | 最多 20 字 | 最多 1000 字，纯文本 | 1-18 张 | 可选 |
-| 抖音 | 最多 55 字 | 描述文字 | 最多 35 张 | 支持 |
-| X/Twitter | 无（推文） | 280 字符（标准），25000（Premium） | 最多 4 张 | 可选 |
+## 相关项目
+
+Superb Publisher 是写作到发布工具链的一部分：
+
+| 项目 | 职责 |
+|------|------|
+| [great-writer](https://github.com/d-wwei/great-writer) | 写作 |
+| [brilliant-visualizer](https://github.com/d-wwei/brilliant-visualizer) | 配图 |
+| [excellent-typesetter](https://github.com/d-wwei/excellent-typesetter) | 排版 |
+| [crisp-articulator](https://github.com/d-wwei/crisp-articulator) | 流水线编排 |
+| **superb-publisher** | 发布（本仓库） |
+
+---
 
 ## License
 
